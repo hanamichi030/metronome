@@ -39,6 +39,7 @@ class ValidatorRuntimeSmokeGuardTests(unittest.TestCase):
             dummy.competition_scores_payload = []
             dummy.resolve_uid = lambda _hotkey: 74
             dummy.runtime_snapshot_path = Path(tmpdir) / "validator_runtime.json"
+            dummy.network_snapshot_path = Path(tmpdir) / "network_snapshot.json"
 
             with patch("neurons.validator.write_runtime_snapshot") as write_snapshot, patch(
                 "neurons.validator.collect_network_snapshot",
