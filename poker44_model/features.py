@@ -160,6 +160,130 @@ def hand_features(hand):
 PERHAND = sorted(hand_features({"metadata": {}, "players": [], "streets": [], "actions": []}).keys())
 _AGG = ("mean", "std", "min", "max", "q10", "q50", "q90")
 
+# The production v1 artifact must keep its exact 180-column FEATURE_NAMES
+# contract.  Challenger-only coherence columns therefore live in a separate
+# schema and are appended only by ``challenger_features`` below.
+_COHERENCE_EXCLUDED_PERHAND = {
+    "amt_mean",
+    "amt_std",
+    "amt_q90",
+    "pot_delta_mean",
+    "pot_growth",
+    "stack_std",
+    "stack_iqr",
+    "hero_action_sh",
+    "button_action_sh",
+}
+COHERENCE_PERHAND = tuple(
+    name for name in PERHAND if name not in _COHERENCE_EXCLUDED_PERHAND
+)
+_COHERENCE_STATS = ("mad", "q25", "q75", "iqr")
+_SIGNATURE_KINDS = (
+    "action",
+    "actor",
+    "street",
+    "amtbucket",
+    "street_action",
+    "full",
+)
+_SIGNATURE_STATS = (
+    "top1_share",
+    "top2_share",
+    "unique_share",
+    "singleton_share",
+    "entropy",
+    "repeat_pair_rate",
+)
+
+
+def _mad(xs):
+    if not xs:
+        return 0.0
+    median = _quant(xs, 0.5)
+    return _quant([abs(float(value) - median) for value in xs], 0.5)
+
+
+def _signature_summary(signatures):
+    """Order-independent repetition statistics for complete-hand signatures."""
+    if not signatures:
+        return {name: 0.0 for name in _SIGNATURE_STATS}
+    counts = Counter(signatures)
+    ordered = sorted(counts.values(), reverse=True)
+    total = float(len(signatures))
+    pairs = total * (total - 1.0) / 2.0
+    repeated_pairs = sum(count * (count - 1) / 2 for count in ordered)
+    return {
+        "top1_share": _div(ordered[0], total),
+        "top2_share": _div(sum(ordered[:2]), total),
+        "unique_share": _div(len(counts), total),
+        "singleton_share": _div(sum(count == 1 for count in ordered), total),
+        "entropy": _entropy(signatures),
+        "repeat_pair_rate": _div(repeated_pairs, pairs),
+    }
+
+
+def _complete_hand_signatures(hand):
+    actions = [action for action in (hand.get("actions") or []) if isinstance(action, dict)]
+    action = tuple(str(item.get("action_type") or "").lower().strip() for item in actions)
+    actor = tuple(_i(item.get("actor_seat"), 0) for item in actions)
+    street = tuple(str(item.get("street") or "").lower().strip() for item in actions)
+    amount = tuple(
+        _amt_bucket(max(0.0, _f(item.get("normalized_amount_bb")))) for item in actions
+    )
+    street_action = tuple(zip(street, action))
+    full = tuple(zip(street, actor, action, amount))
+    return {
+        "action": action,
+        "actor": actor,
+        "street": street,
+        "amtbucket": amount,
+        "street_action": street_action,
+        "full": full,
+    }
+
+
+COHERENCE_FEATURE_NAMES = tuple(
+    sorted(
+        [
+            f"coherent_{name}_{stat}"
+            for name in COHERENCE_PERHAND
+            for stat in _COHERENCE_STATS
+        ]
+        + [
+            f"coherent_sig_{kind}_{stat}"
+            for kind in _SIGNATURE_KINDS
+            for stat in _SIGNATURE_STATS
+        ]
+    )
+)
+
+
+def coherence_features(chunk):
+    """Robust cross-hand distribution and complete-signature features.
+
+    These columns intentionally ignore identifiers, outcomes, cards, source
+    dates, and hand order.  Action order *inside* a hand remains meaningful.
+    """
+    output = {name: 0.0 for name in COHERENCE_FEATURE_NAMES}
+    if not chunk:
+        return output
+    rows = [hand_features(hand) for hand in chunk]
+    for name in COHERENCE_PERHAND:
+        values = [float(row[name]) for row in rows]
+        q25 = _quant(values, 0.25)
+        q75 = _quant(values, 0.75)
+        output[f"coherent_{name}_mad"] = _mad(values)
+        output[f"coherent_{name}_q25"] = q25
+        output[f"coherent_{name}_q75"] = q75
+        output[f"coherent_{name}_iqr"] = q75 - q25
+
+    signatures = [_complete_hand_signatures(hand) for hand in chunk]
+    for kind in _SIGNATURE_KINDS:
+        summary = _signature_summary([row[kind] for row in signatures])
+        for stat, value in summary.items():
+            output[f"coherent_sig_{kind}_{stat}"] = float(value)
+    return output
+
 
 def chunk_features(chunk):
     if not chunk:
@@ -210,3 +334,12 @@ _ALL_V3_FEATURE_NAMES = sorted(
 # predict_proba spread. This is the EXACT column order the committed
 # model.joblib was trained on (v5_sani C2) — do NOT reorder or regenerate.
 FEATURE_NAMES = ["action_count_max", "action_count_mean", "action_count_min", "action_count_q10", "action_count_q50", "action_count_q90", "action_count_std", "action_entropy_max", "action_entropy_mean", "action_entropy_min", "action_entropy_q10", "action_entropy_q50", "action_entropy_q90", "action_entropy_std", "action_run_max_max", "action_run_max_mean", "action_run_max_min", "action_run_max_q10", "action_run_max_q50", "action_run_max_q90", "action_run_max_std", "actor_entropy_max", "actor_entropy_mean", "actor_entropy_min", "actor_entropy_q10", "actor_entropy_q50", "actor_entropy_q90", "actor_entropy_std", "actor_run_max_max", "actor_run_max_mean", "actor_run_max_min", "actor_run_max_q10", "actor_run_max_q50", "actor_run_max_q90", "actor_run_max_std", "actor_switch_rate_max", "actor_switch_rate_mean", "actor_switch_rate_min", "actor_switch_rate_q10", "actor_switch_rate_q50", "actor_switch_rate_q90", "actor_switch_rate_std", "aggr_sh_max", "aggr_sh_mean", "aggr_sh_min", "aggr_sh_q10", "aggr_sh_q50", "aggr_sh_q90", "aggr_sh_std", "bet_sh_max", "bet_sh_mean", "bet_sh_min", "bet_sh_q10", "bet_sh_q50", "bet_sh_q90", "bet_sh_std", "call_sh_max", "call_sh_mean", "call_sh_min", "call_sh_q10", "call_sh_q50", "call_sh_q90", "call_sh_std", "call_to_sh_max", "call_to_sh_mean", "call_to_sh_min", "call_to_sh_q10", "call_to_sh_q50", "call_to_sh_q90", "call_to_sh_std", "check_sh_max", "check_sh_mean", "check_sh_min", "check_sh_q10", "check_sh_q50", "check_sh_q90", "check_sh_std", "fold_sh_max", "fold_sh_mean", "fold_sh_min", "fold_sh_q10", "fold_sh_q50", "fold_sh_q90", "fold_sh_std", "hand_count", "high_actor_entropy_rate", "long_action_hand_rate", "low_action_entropy_rate", "nonzero_amt_sh_max", "nonzero_amt_sh_mean", "nonzero_amt_sh_min", "nonzero_amt_sh_q10", "nonzero_amt_sh_q50", "nonzero_amt_sh_q90", "nonzero_amt_sh_std", "passive_sh_max", "passive_sh_mean", "passive_sh_min", "passive_sh_q10", "passive_sh_q50", "passive_sh_q90", "passive_sh_std", "player_count_max", "player_count_mean", "player_count_min", "player_count_q10", "player_count_q50", "player_count_q90", "player_count_std", "postflop_sh_max", "postflop_sh_mean", "postflop_sh_min", "postflop_sh_q10", "postflop_sh_q50", "postflop_sh_q90", "postflop_sh_std", "pot_monotonic_max", "pot_monotonic_mean", "pot_monotonic_min", "pot_monotonic_q10", "pot_monotonic_q50", "pot_monotonic_q90", "pot_monotonic_std", "preflop_sh_max", "preflop_sh_mean", "preflop_sh_min", "preflop_sh_q10", "preflop_sh_q50", "preflop_sh_q90", "preflop_sh_std", "raise_sh_max", "raise_sh_mean", "raise_sh_min", "raise_sh_q10", "raise_sh_q50", "raise_sh_q90", "raise_sh_std", "raise_to_sh_max", "raise_to_sh_mean", "raise_to_sh_min", "raise_to_sh_q10", "raise_to_sh_q50", "raise_to_sh_q90", "raise_to_sh_std", "seat_util_max", "seat_util_mean", "seat_util_min", "seat_util_q10", "seat_util_q50", "seat_util_q90", "seat_util_std", "sig_action_top_share", "sig_action_unique_share", "sig_actor_top_share", "sig_actor_unique_share", "sig_amtbucket_top_share", "sig_amtbucket_unique_share", "sig_street_top_share", "sig_street_unique_share", "street_count_max", "street_count_mean", "street_count_min", "street_count_q10", "street_count_q50", "street_count_q90", "street_count_std", "street_entropy_max", "street_entropy_mean", "street_entropy_min", "street_entropy_q10", "street_entropy_q50", "street_entropy_q90", "street_entropy_std", "unique_actor_sh_max", "unique_actor_sh_mean", "unique_actor_sh_min", "unique_actor_sh_q10", "unique_actor_sh_q50", "unique_actor_sh_q90", "unique_actor_sh_std"]
+
+CHALLENGER_FEATURE_NAMES = tuple(FEATURE_NAMES) + COHERENCE_FEATURE_NAMES
+
+
+def challenger_features(chunk):
+    """Return the stable current-plus-coherence challenger feature row."""
+    output = chunk_features(chunk)
+    output.update(coherence_features(chunk))
+    return output

@@ -20,7 +20,7 @@ from poker44.utils.model_manifest import (
     manifest_digest,
 )
 from poker44.validator.synapse import DetectionSynapse
-from poker44_model import score_batch
+from poker44_model import score_batch, warmup_model
 from poker44_model.capture import save_capture
 
 
@@ -30,6 +30,12 @@ class Miner(BaseMinerNeuron):
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
         bt.logging.info("🤖 Poker44 Miner started")
+        loaded_model = warmup_model()
+        challenger = loaded_model["strategy"] == "rank_input_coherence_v1"
+        bt.logging.info(
+            f"Model warmup complete | model={loaded_model['model_name']} "
+            f"version={loaded_model['model_version']} strategy={loaded_model['strategy']}"
+        )
         repo_root = Path(__file__).resolve().parents[1]
         # Hash EVERY file that backs the served model so implementation_sha256
         # actually reflects the running code. Add new model files here.
@@ -49,12 +55,25 @@ class Miner(BaseMinerNeuron):
             repo_root=repo_root,
             implementation_files=implementation_files,
             defaults={
-                "model_name": "poker239-rankfuse-ens3",
-                "model_version": "1",
-                "framework": "lightgbm+xgboost+sklearn-ensemble",
+                "model_name": loaded_model["model_name"],
+                "model_version": loaded_model["model_version"],
+                "framework": (
+                    "lightgbm+xgboost+sklearn-rank-input-coherence"
+                    if challenger
+                    else "lightgbm+xgboost+sklearn-ensemble"
+                ),
                 "license": "MIT",
                 "repo_url": "",
-                "notes": "Within-batch rank-fused ensemble (stacked GBDT + sign-stable monotone LGBM + PCA->MLP) over 180 sanitization-invariant behavioral features (poker44_model/); strictly-monotone reward-fit decision layer, deterministic top-10% crossing, no isotonic calibration.",
+                "notes": (
+                    "Request-ranked ensemble over 180 stable behavioral plus 132 "
+                    "cross-hand coherence features: raw Stack/MLP and rank-input "
+                    "ExtraTrees/HistGradientBoosting branches, tie-free rank fusion, "
+                    "and deterministic top-10% threshold crossing."
+                    if challenger
+                    else "Within-batch rank-fused ensemble (stacked GBDT + sign-stable "
+                    "monotone LGBM + PCA->MLP) over 180 sanitization-invariant "
+                    "behavioral features; tie-free reward-fit decision layer."
+                ),
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (

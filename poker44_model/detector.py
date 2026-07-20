@@ -24,7 +24,7 @@ Members (all over the identical 180-dim FEATURE_NAMES row)
                decorrelated from the tree members.
 
 Fusion is calibration-free: each member's WITHIN-BATCH rank (argsort/argsort/(n-1))
-is averaged with fixed weights (0.35, 0.30, 0.35), so no member's OOD score-scale
+is averaged with artifact weights (currently 0.40, 0.25, 0.35), so no member's OOD score-scale
 can distort the blend. The fused rank is the movable ordering that drives the 65%
 RANK block.
 
@@ -56,12 +56,19 @@ offline training matrix sanitizes raw benchmark hands (train == serve).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 
 import numpy as np
 import joblib
 
-from poker44_model.features import chunk_features, FEATURE_NAMES
+from poker44_model.features import (
+    CHALLENGER_FEATURE_NAMES,
+    FEATURE_NAMES,
+    challenger_features,
+    chunk_features,
+)
 
 try:  # keep any torch backend single-threaded (never deadlock batched predict)
     import torch  # noqa: F401
@@ -70,6 +77,43 @@ except Exception:
     pass
 
 _MODEL = None
+CHALLENGER_STRATEGY = "rank_input_coherence_v1"
+
+
+def validate_artifact(artifact):
+    """Fail fast when an artifact cannot satisfy the serving contract."""
+    if not isinstance(artifact, dict):
+        raise TypeError("model artifact must be a dictionary")
+    strategy = artifact.get("strategy")
+    if strategy == CHALLENGER_STRATEGY:
+        required = (
+            "stack",
+            "mlp",
+            "rank_extra",
+            "rank_hist",
+            "branch_weights",
+            "challenger_feature_names",
+        )
+        missing = [name for name in required if name not in artifact]
+        if missing:
+            raise ValueError(f"challenger artifact missing {missing}")
+        if tuple(artifact["challenger_feature_names"]) != CHALLENGER_FEATURE_NAMES:
+            raise ValueError("challenger feature schema mismatch; retrain artifact")
+        weights = np.asarray(artifact["branch_weights"], dtype=float)
+        if weights.shape != (4,) or np.any(weights < 0.0) or float(weights.sum()) <= 0.0:
+            raise ValueError("challenger branch_weights must contain four non-negative values")
+    else:
+        required = ("stack", "mono", "mlp", "weights")
+        missing = [name for name in required if name not in artifact]
+        if missing:
+            raise ValueError(f"legacy artifact missing {missing}")
+        weights = np.asarray(artifact["weights"], dtype=float)
+        if weights.shape != (3,) or np.any(weights < 0.0) or float(weights.sum()) <= 0.0:
+            raise ValueError("legacy weights must contain three non-negative values")
+    for name in ("Q", "MARGIN", "FLOOR"):
+        if name not in artifact:
+            raise ValueError(f"artifact missing decision parameter {name}")
+    return artifact
 
 
 def _pin_single_thread(est):
@@ -101,8 +145,12 @@ def _pin_single_thread(est):
 def _model():
     global _MODEL
     if _MODEL is None:
-        b = joblib.load(os.path.join(os.path.dirname(__file__), "model.joblib"))
-        for key in ("stack", "mono", "mlp"):
+        default_path = os.path.join(os.path.dirname(__file__), "model.joblib")
+        selected_path = os.path.expanduser(
+            os.environ.get("POKER44_MODEL_PATH", default_path).strip() or default_path
+        )
+        b = validate_artifact(joblib.load(selected_path))
+        for key in ("stack", "mono", "mlp", "rank_extra", "rank_hist"):
             try:
                 _pin_single_thread(b[key])
             except Exception:
@@ -119,6 +167,56 @@ def _rank01(s):
     return np.argsort(np.argsort(s, kind="stable"), kind="stable").astype(float) / (s.size - 1)
 
 
+def columnwise_batch_rank(matrix):
+    """Tie-averaged [0,1] feature percentiles inside one request.
+
+    Training applies this independently inside each source date. Serving
+    applies it to the current validator request, avoiding frozen raw-feature
+    scales while never reading labels or identifiers.
+    """
+    values = np.nan_to_num(
+        np.asarray(matrix, dtype=float), nan=0.0, posinf=1e6, neginf=-1e6
+    )
+    if values.ndim != 2:
+        raise ValueError("feature matrix must be two-dimensional")
+    rows, columns = values.shape
+    if rows <= 1:
+        return np.full_like(values, 0.5)
+    ranked = np.empty_like(values)
+    denominator = float(rows - 1)
+    for column in range(columns):
+        series = values[:, column]
+        order = np.argsort(series, kind="mergesort")
+        ordered = series[order]
+        starts = np.r_[0, np.flatnonzero(ordered[1:] != ordered[:-1]) + 1]
+        ends = np.r_[starts[1:], rows]
+        for start, end in zip(starts, ends):
+            average = (float(start) + float(end - 1)) / (2.0 * denominator)
+            ranked[order[start:end], column] = average
+    return ranked
+
+
+def _strict_rank01(scores, tie_keys=None):
+    """Total-order branch scores without index-dependent tie plateaus."""
+    values = np.asarray(scores, dtype=float)
+    if values.size <= 1:
+        return np.zeros_like(values)
+    keys = list(tie_keys or [f"{index:012d}" for index in range(values.size)])
+    if len(keys) != values.size:
+        raise ValueError("tie key count does not match scores")
+    order = sorted(
+        range(values.size), key=lambda index: (float(values[index]), str(keys[index]))
+    )
+    ranked = np.empty(values.size, dtype=float)
+    ranked[order] = np.arange(values.size, dtype=float) / (values.size - 1)
+    return ranked
+
+
+def _chunk_tie_key(chunk):
+    payload = json.dumps(chunk, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _rows(chunks):
     rows = []
     for c in chunks:
@@ -127,15 +225,12 @@ def _rows(chunks):
     return np.array(rows, dtype=float)
 
 
-def _fused_rank(model, chunks):
-    """Weighted average of each member's WITHIN-BATCH rank (the movable ordering)."""
-    X = _rows(chunks)
-    s1 = model["stack"].predict_proba(X)[:, 1]
-    s2 = model["mono"].predict_proba(X)[:, 1]
-    s3 = model["mlp"].predict_proba(X)[:, 1]
-    w1, w2, w3 = model["weights"]
-    fused = (w1 * _rank01(s1) + w2 * _rank01(s2) + w3 * _rank01(s3)) / (w1 + w2 + w3)
-    return fused
+def _challenger_rows(chunks):
+    rows = []
+    for chunk in chunks:
+        features = challenger_features(chunk)
+        rows.append([features.get(name, 0.0) for name in CHALLENGER_FEATURE_NAMES])
+    return np.asarray(rows, dtype=float)
 
 
 def _logit(p, eps):
@@ -197,16 +292,126 @@ def _decision(model, v):
     return [round(float(s), 9) for s in scores]
 
 
+def score_rows_with_artifact(
+    artifact,
+    base_rows,
+    full_rows=None,
+    *,
+    tie_keys=None,
+    positive_fraction=None,
+):
+    """Score precomputed rows for reproducible window replay and training.
+
+    The production path calls the same function after extracting rows from raw
+    chunks.  Keeping a row-level entry point makes 40/100-chunk replay fast
+    enough to evaluate hundreds of windows without changing inference logic.
+    """
+    model = validate_artifact(artifact)
+    base = np.asarray(base_rows, dtype=float)
+    if base.ndim != 2 or base.shape[1] != len(FEATURE_NAMES):
+        raise ValueError("base feature matrix does not match FEATURE_NAMES")
+    branches = branch_rank_matrix_with_artifact(
+        model, base, full_rows, tie_keys=tie_keys
+    )
+    return score_branch_ranks_with_artifact(
+        model, branches, tie_keys=tie_keys, positive_fraction=positive_fraction
+    )
+
+
+def branch_rank_matrix_with_artifact(
+    artifact, base_rows, full_rows=None, *, tie_keys=None
+):
+    """Return ranked member outputs so replay can reuse expensive predictions."""
+    model = validate_artifact(artifact)
+    base = np.asarray(base_rows, dtype=float)
+    if base.ndim != 2 or base.shape[1] != len(FEATURE_NAMES):
+        raise ValueError("base feature matrix does not match FEATURE_NAMES")
+    if model.get("strategy") == CHALLENGER_STRATEGY:
+        full = np.asarray(full_rows, dtype=float)
+        if full.shape != (len(base), len(CHALLENGER_FEATURE_NAMES)):
+            raise ValueError("challenger feature matrix has the wrong shape")
+        ranked_input = columnwise_batch_rank(full)
+        raw = (
+            model["stack"].predict_proba(base)[:, 1],
+            model["mlp"].predict_proba(base)[:, 1],
+            model["rank_extra"].predict_proba(ranked_input)[:, 1],
+            model["rank_hist"].predict_proba(ranked_input)[:, 1],
+        )
+        return np.column_stack(
+            [_strict_rank01(values, tie_keys=tie_keys) for values in raw]
+        )
+    raw = (
+        model["stack"].predict_proba(base)[:, 1],
+        model["mono"].predict_proba(base)[:, 1],
+        model["mlp"].predict_proba(base)[:, 1],
+    )
+    return np.column_stack([_rank01(values) for values in raw])
+
+
+def score_branch_ranks_with_artifact(
+    artifact, branch_ranks, *, tie_keys=None, positive_fraction=None
+):
+    """Apply configured fusion and the production decision layer."""
+    model = validate_artifact(artifact)
+    branches = np.asarray(branch_ranks, dtype=float)
+    weights = np.asarray(
+        model["branch_weights"]
+        if model.get("strategy") == CHALLENGER_STRATEGY
+        else model["weights"],
+        dtype=float,
+    )
+    if branches.shape != (len(branches), len(weights)):
+        raise ValueError("branch rank matrix does not match artifact weights")
+    fused = branches @ (weights / weights.sum())
+    if model.get("strategy") == CHALLENGER_STRATEGY:
+        fused = _strict_rank01(fused, tie_keys=tie_keys)
+    decision_model = model
+    if positive_fraction is not None:
+        decision_model = dict(model)
+        decision_model["FLOOR"] = float(positive_fraction)
+    return _decision(decision_model, fused)
+
+
+def score_with_artifact(artifact, chunks, *, positive_fraction=None):
+    chunks = chunks or []
+    if not chunks:
+        return []
+    if artifact.get("strategy") == CHALLENGER_STRATEGY:
+        full = _challenger_rows(chunks)
+        # CHALLENGER_FEATURE_NAMES deliberately begins with FEATURE_NAMES, so
+        # the incumbent branches can reuse the same extraction pass.
+        base = full[:, : len(FEATURE_NAMES)]
+    else:
+        base = _rows(chunks)
+        full = None
+    return score_rows_with_artifact(
+        artifact,
+        base,
+        full,
+        tie_keys=[_chunk_tie_key(chunk) for chunk in chunks],
+        positive_fraction=positive_fraction,
+    )
+
+
 def score_batch(chunks):
-    """One bot-risk score in [0,1] per chunk (rank-fused, reward-fit floating output)."""
+    """One bot-risk score in [0,1] per chunk using the selected artifact."""
     chunks = chunks or []
     if not chunks:
         return []
     try:
-        m = _model()
-        return _decision(m, _fused_rank(m, chunks))
+        return score_with_artifact(_model(), chunks)
     except Exception:
         return [0.5] * len(chunks)
+
+
+def warmup_model():
+    """Load and validate the artifact before the axon accepts its first query."""
+    model = _model()
+    return {
+        "model_name": str(model.get("model_name") or "poker239-rankfuse-ens3"),
+        "model_version": str(model.get("model_version") or "1"),
+        "strategy": str(model.get("strategy") or "legacy_rank_fusion"),
+    }
 
 
 def score_chunk(chunk):
@@ -215,6 +420,16 @@ def score_chunk(chunk):
         if not chunk:
             return 0.5
         m = _model()
+        if m.get("strategy") == CHALLENGER_STRATEGY:
+            # A one-row request has no useful percentile context.  Use the raw
+            # incumbent branches; validators call score_batch with a request.
+            X = _rows([chunk])
+            weights = np.asarray(m["branch_weights"][:2], dtype=float)
+            raw = (
+                weights[0] * m["stack"].predict_proba(X)[:, 1]
+                + weights[1] * m["mlp"].predict_proba(X)[:, 1]
+            ) / max(float(weights.sum()), 1e-12)
+            return round(float(raw[0]), 6)
         # No batch context for a lone chunk: return the calibrated member-mean prob.
         X = _rows([chunk])
         s = (m["weights"][0] * m["stack"].predict_proba(X)[:, 1]

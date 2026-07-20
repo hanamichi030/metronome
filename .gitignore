@@ -25,6 +25,7 @@ model/*
 
 models/*
 runs/*
+.uid239_lab/
 # C extensions
 *.so
 
