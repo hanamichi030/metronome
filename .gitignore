@@ -223,3 +223,7 @@ poker44_model/captures/
 _bench_cache.npz
 *_cache.npz
 _train.log
+
+# model delivery / deploy artifacts (never commit)
+*.tgz
+DEPLOY_VPS.txt

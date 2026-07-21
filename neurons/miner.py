@@ -37,7 +37,9 @@ class Miner(BaseMinerNeuron):
             Path(__file__).resolve(),
             repo_root / "poker44_model" / "__init__.py",
             repo_root / "poker44_model" / "detector.py",
-            repo_root / "poker44_model" / "features.py",
+            repo_root / "poker44_model" / "union_features.py",
+            repo_root / "poker44_model" / "features_v2.py",
+            repo_root / "poker44_model" / "base_features.py",
             repo_root / "poker44_model" / "model.joblib",
             repo_root / "poker44_model" / "capture.py",
         ]
@@ -49,12 +51,12 @@ class Miner(BaseMinerNeuron):
             repo_root=repo_root,
             implementation_files=implementation_files,
             defaults={
-                "model_name": "poker239-rankfuse-ens3",
+                "model_name": "poker239-irunion",
                 "model_version": "1",
-                "framework": "lightgbm+xgboost+sklearn-ensemble",
+                "framework": "sklearn-ensemble",
                 "license": "MIT",
                 "repo_url": "",
-                "notes": "Within-batch rank-fused ensemble (stacked GBDT + sign-stable monotone LGBM + PCA->MLP) over 180 sanitization-invariant behavioral features (poker44_model/); strictly-monotone reward-fit decision layer, deterministic top-10% crossing, no isotonic calibration.",
+                "notes": "Input-rank soft-vote ensemble (ExtraTrees+RandomForest+HistGradientBoosting) over a 452-dim union order-statistic feature surface with a per-request within-window rank transform (poker44_model/); strictly-monotone tie-free decision layer, deterministic top-10% crossing, no isotonic calibration.",
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (

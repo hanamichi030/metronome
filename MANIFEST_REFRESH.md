@@ -1,7 +1,10 @@
-# Manifest refresh 2026-07-16
-Served model: poker239-rankfuse-ens3 — a within-batch rank-fused ensemble of 3
-decorrelated members (stacked GBDT [LightGBM+XGBoost+RandomForest -> logistic OOF]
-+ sign-stability-gated monotone LightGBM + PCA->MLPClassifier) over 180
-sanitization-invariant behavioral features, strictly-monotone reward-fit decision
-layer (isotonic removed), n_jobs=1. Repo: https://github.com/hanamichi030/metronome .
-This commit requests a fresh backend manifest re-review for the uid239 slot.
+# Manifest refresh — uid239
+
+Served model: poker239-irunion (input-rank soft-vote ensemble — ExtraTrees +
+RandomForest + HistGradientBoosting — over a 452-dim union order-statistic
+feature surface with a per-request within-window rank transform, a
+strictly-monotone tie-free decision layer, and no isotonic calibration).
+Repo: https://github.com/hanamichi030/metronome . See poker44_model/.
+
+This commit forces a validator/backend manifest re-review so the recorded
+manifest matches the code actually served by this repo for uid239.
